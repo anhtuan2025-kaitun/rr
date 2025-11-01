@@ -1,0 +1,439 @@
+-- TuanxAura Chest Finder v4 — Part 1/5 (Init + Settings + Services)
+if getgenv().TuanxAura_Chest_v4_Ran then return end
+getgenv().TuanxAura_Chest_v4_Ran = true
+
+-- ===== CONFIG ( chỉnh tại đây nếu cần ) =====
+local SETTINGS = {
+    Team = "Marines",           -- "Marines" hoặc "Pirates" (nếu cần auto-join)
+    ScanInterval = 2.0,         -- quét workspace mỗi X giây
+    HopTimeout = 30,            -- sau Hoạt động không thấy chest → hop
+    SafeTPStep = 150,           -- mỗi lần TP tối đa (studs)
+    SafeTPDelay = 0.04,         -- delay giữa các bước TP (giây)
+    ReturnAfterPick = true,     -- về vị trí an toàn sau khi nhặt
+    FlyBackHeight = 6,          -- cao hơn mặt đất khi TP (studs)
+    LoadDelay = 5,              -- đợi sau GameLoaded (giây)
+    UIVisible = true,
+    ShowESP = true,
+    SaveConfigFile = "TuanxAura_Chest_v4.json"
+}
+-- ==============================================
+
+-- Services
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ContentProvider = game:GetService("ContentProvider")
+
+local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+repeat task.wait() until player and player.Character and player:FindFirstChild("PlayerGui")
+
+-- small load delay
+task.wait(math.max(0, tonumber(SETTINGS.LoadDelay) or 0))
+
+-- Safe pcall wrapper
+local function safe_pcall(f, ...)
+    local ok, res = pcall(f, ...)
+    return ok, res
+end
+
+-- Config save/load (safe, optional)
+local function SaveConfig()
+    pcall(function()
+        if writefile and HttpService then
+            writefile(SETTINGS.SaveConfigFile, HttpService:JSONEncode(SETTINGS))
+        end
+    end)
+end
+local function LoadConfig()
+    pcall(function()
+        if isfile and isfile(SETTINGS.SaveConfigFile) then
+            local raw = readfile(SETTINGS.SaveConfigFile)
+            local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok and type(data) == "table" then
+                for k,v in pairs(data) do
+                    if SETTINGS[k] ~= nil then SETTINGS[k] = v end
+                end
+            end
+        end
+    end)
+end
+LoadConfig()
+
+-- Notification helper (Vietnamese)
+local function NotifyViet(msg)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "TuanxAura Chest",
+            Text = tostring(msg),
+            Duration = 3
+        })
+    end)
+end
+
+-- Anti-AFK (VirtualUser)
+pcall(function()
+    local vu = game:GetService("VirtualUser")
+    player.Idled:Connect(function()
+        vu:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        vu:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+    end)
+end)
+-- Part 2/5 (UI Neon + Toggle Button + Timer)
+local PlayerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui")
+-- Remove old gui
+pcall(function() if PlayerGui:FindFirstChild("TuanxAura_Chest_v4_GUI") then PlayerGui.TuanxAura_Chest_v4_GUI:Destroy() end end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "TuanxAura_Chest_v4_GUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = PlayerGui
+
+local function setProps(obj, props)
+    for k,v in pairs(props) do pcall(function() obj[k] = v end) end
+    return obj
+end
+
+-- Main frame centered, neon look
+local Main = setProps(Instance.new("Frame"), {
+    Name = "Main", Parent = ScreenGui,
+    Size = UDim2.new(0, 420, 0, 170),
+    Position = UDim2.new(0.5, 0, 0.45, 0),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.fromRGB(8,10,12),
+    BackgroundTransparency = 0.08,
+    Visible = SETTINGS.UIVisible
+})
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0,16)
+local stroke = Instance.new("UIStroke", Main)
+stroke.Color = Color3.fromRGB(0,255,165); stroke.Thickness = 2; stroke.LineJoinMode = Enum.LineJoinMode.Round
+
+-- Title
+local Title = setProps(Instance.new("TextLabel"), {
+    Parent = Main, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 16, 0, 10), Size = UDim2.new(1,-32,0,36),
+    Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = Color3.fromRGB(0,255,165),
+    Text = "💎 TUANXAURA CHEST FINDER v4 (Shield)", TextXAlignment = Enum.TextXAlignment.Center
+})
+
+-- Status / Counter / Timer
+local Status = setProps(Instance.new("TextLabel"), {
+    Parent = Main, BackgroundTransparency = 1,
+    Position = UDim2.new(0.5, 0, 0, 54), AnchorPoint = Vector2.new(0.5,0),
+    Size = UDim2.new(0.92,0,0,24), Font = Enum.Font.GothamSemibold, TextSize = 16, TextColor3 = Color3.fromRGB(240,240,240),
+    Text = "⏳ Trạng thái: Đang quét rương..."
+})
+local Counter = setProps(Instance.new("TextLabel"), {
+    Parent = Main, BackgroundTransparency = 1,
+    Position = UDim2.new(0.5, 0, 0, 86), AnchorPoint = Vector2.new(0.5,0),
+    Size = UDim2.new(0.92,0,0,26), Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = Color3.fromRGB(0,255,180),
+    Text = "🪙 Đã nhặt: 0"
+})
+local TimerLabel = setProps(Instance.new("TextLabel"), {
+    Parent = Main, BackgroundTransparency = 1,
+    Position = UDim2.new(0.5, 0, 0, 116), AnchorPoint = Vector2.new(0.5,0),
+    Size = UDim2.new(0.92,0,0,20), Font = Enum.Font.SourceSans, TextSize = 14, TextColor3 = Color3.fromRGB(180,255,200),
+    Text = "⏱ Thời gian: 00:00"
+})
+
+-- round toggle button bottom-right (small)
+local ToggleBtn = setProps(Instance.new("ImageButton"), {
+    Parent = ScreenGui, Name = "ToggleBtn",
+    Size = UDim2.new(0,56,0,56),
+    Position = UDim2.new(0.92, 0, 0.06, 0),
+    AnchorPoint = Vector2.new(0.5,0.5),
+    BackgroundColor3 = Color3.fromRGB(0,255,165), Image = "",
+    AutoButtonColor = false
+})
+local corner = Instance.new("UICorner", ToggleBtn); corner.CornerRadius = UDim.new(1,0)
+local ico = setProps(Instance.new("TextLabel", ToggleBtn), {
+    Size = UDim2.new(1,0,1,0), BackgroundTransparency = 1, Text = "UI", Font = Enum.Font.GothamBold, TextSize = 20, TextColor3 = Color3.fromRGB(6,6,6)
+})
+
+-- fade-in effect on Main when spawn
+do
+    Main.BackgroundTransparency = 1
+    stroke.Transparency = 1
+    Title.TextTransparency = 1
+    Status.TextTransparency = 1
+    Counter.TextTransparency = 1
+    TimerLabel.TextTransparency = 1
+    TweenService:Create(Main, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {BackgroundTransparency = 0.08}):Play()
+    TweenService:Create(stroke, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {Transparency = 0}):Play()
+    TweenService:Create(Title, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {TextTransparency = 0}):Play()
+    TweenService:Create(Status, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {TextTransparency = 0}):Play()
+    TweenService:Create(Counter, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {TextTransparency = 0}):Play()
+    TweenService:Create(TimerLabel, TweenInfo.new(0.6, Enum.EasingStyle.Quad), {TextTransparency = 0}):Play()
+end
+
+-- Toggle behavior (UI show/hide smooth)
+local uiVisible = SETTINGS.UIVisible
+ToggleBtn.MouseButton1Click:Connect(function()
+    uiVisible = not uiVisible
+    SETTINGS.UIVisible = uiVisible
+    SaveConfig()
+    if uiVisible then
+        Main.Visible = true
+        TweenService:Create(Main, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {BackgroundTransparency = 0.08}):Play()
+    else
+        TweenService:Create(Main, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {BackgroundTransparency = 1}):Play()
+        task.delay(0.25, function() Main.Visible = false end)
+    end
+    ico.Text = uiVisible and "TẮT" or "MỞ"
+end)
+
+-- store refs globally
+_G.TuanxAura_Chest_v4 = { Main = Main, Status = Status, Counter = Counter, TimerLabel = TimerLabel, ToggleBtn = ToggleBtn }
+-- timer update
+local startTick = tick()
+task.spawn(function()
+    while true do
+        task.wait(1)
+        local elapsed = math.floor(tick() - startTick)
+        local mm = math.floor(elapsed/60); local ss = elapsed % 60
+        pcall(function() TimerLabel.Text = string.format("⏱ Thời gian: %02d:%02d", mm, ss) end)
+    end
+end)
+-- Part 3/5 (SafeTP chunked instant teleport + helpers)
+local function getHRP()
+    if not player or not player.Character then return nil end
+    return player.Character:FindFirstChild("HumanoidRootPart") or player.Character:FindFirstChild("LowerTorso")
+end
+
+-- Safe instant-teleport broken into steps to reduce server rejection
+local function SafeTP(goalCFrame)
+    local root = getHRP()
+    if not root then return false end
+    local goal = goalCFrame.Position
+    local step = math.max(50, math.min(SETTINGS.SafeTPStep or 150, 600)) -- step size
+    local maxRetries = 2
+
+    for attempt = 1, maxRetries do
+        if not root or not root.Parent then return false end
+        local distance = (goal - root.Position).Magnitude
+        if distance <= step then
+            pcall(function() root.CFrame = CFrame.new(goal.X, goal.Y + (SETTINGS.FlyBackHeight or 6), goal.Z) end)
+            task.wait(SETTINGS.SafeTPDelay or 0.04)
+            return true
+        end
+
+        local dir = (goal - root.Position).Unit
+        local steps = math.ceil(distance / step)
+        for i = 1, steps do
+            if not root or not root.Parent then return false end
+            local nextPos = root.Position + dir * math.min(step, (goal - root.Position).Magnitude)
+            -- ensure height safe
+            local targetY = nextPos.Y
+            pcall(function() root.CFrame = CFrame.new(nextPos.X, targetY + (SETTINGS.FlyBackHeight or 6), nextPos.Z) end)
+            task.wait(SETTINGS.SafeTPDelay or 0.04)
+            -- if fell into void/sea, try to recover
+            if root.Position.Y < -50 then
+                -- move up and break to outer retry
+                pcall(function() root.CFrame = CFrame.new(root.Position.X, 80, root.Position.Z) end)
+                task.wait(0.8)
+            end
+        end
+        -- final position ensure
+        pcall(function() root.CFrame = CFrame.new(goal.X, goal.Y + (SETTINGS.FlyBackHeight or 6), goal.Z) end)
+        task.wait(0.06)
+        return true
+    end
+    return false
+end
+
+-- Safe return to ground/land under current position
+local function GetSafeLandBelow(pos)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {player.Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local ray = Workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -400, 0), rayParams)
+    if ray and ray.Position then
+        return ray.Position + Vector3.new(0, 3, 0)
+    end
+    return pos + Vector3.new(0, 10, 0)
+end
+
+-- Respawn handler: wait for character and HRP
+local function WaitForCharacter()
+    repeat task.wait() until player and player.Character
+    repeat task.wait() until getHRP()
+    task.wait(1)
+end
+
+-- Mark chest as picked by caching its Instance (avoid revisiting)
+local pickedCache = {}
+local function MarkPicked(inst)
+    pcall(function() pickedCache[inst] = tick() end)
+end
+local function RecentlyPicked(inst)
+    local t = pickedCache[inst]
+    if not t then return false end
+    return (tick() - t) < 20 -- avoid 20s
+end
+-- Part 4/5 (Chest detection + ESP + Pickup)
+local ESPs = {}
+
+local function IsValidChest(model)
+    if not model or not model:IsA("Model") then return false end
+    local name = tostring(model.Name):lower()
+    -- common chest keywords (tweak if your game uses different names)
+    if not (name:find("chest") or name:find("crate") or name:find("box")) then return false end
+    -- must have a primary part or handle
+    local handle = model:FindFirstChild("Handle") or model.PrimaryPart
+    if not handle or not handle:IsA("BasePart") then return false end
+    -- exclude NPCs (humanoid) and players
+    if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("HumanoidRootPart") then return false end
+    -- ensure in workspace
+    if model.Parent ~= Workspace and not model:IsDescendantOf(Workspace) then return false end
+    -- not recently picked
+    if RecentlyPicked(model) then return false end
+    return true
+end
+
+local function FindAllChests()
+    local out = {}
+    for _, obj in pairs(Workspace:GetDescendants()) do
+        if obj:IsA("Model") and IsValidChest(obj) then
+            table.insert(out, obj)
+        end
+    end
+    return out
+end
+
+-- Create billboard ESP for a part
+local function CreateESPForPart(part, label)
+    if not SETTINGS.ShowESP or not part then return end
+    if ESPs[part] and ESPs[part].Parent then return end
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "TuanxAura_ChestESP"
+    bb.Adornee = part
+    bb.Size = UDim2.new(0,140,0,32)
+    bb.StudsOffset = Vector3.new(0,2.4,0)
+    bb.AlwaysOnTop = true
+    local t = Instance.new("TextLabel", bb)
+    t.Size = UDim2.new(1,0,1,0); t.BackgroundTransparency = 1; t.Font = Enum.Font.GothamBold
+    t.TextSize = 14; t.TextColor3 = Color3.fromRGB(0,255,170); t.Text = label or tostring(part.Name)
+    bb.Parent = _G.TuanxAura_Chest_v4 and _G.TuanxAura_Chest_v4.Main.Parent or PlayerGui
+    ESPs[part] = bb
+end
+
+local function CleanupESPs()
+    for p,g in pairs(ESPs) do
+        if not p or not p.Parent then
+            pcall(function() g:Destroy() end)
+            ESPs[p] = nil
+        end
+    end
+end
+
+-- Attempt to "pick up" a chest: move to its handle and wait briefly
+local function AttemptPickupChest(chestModel)
+    if not chestModel or not chestModel.Parent then return false end
+    local handle = chestModel:FindFirstChild("Handle") or chestModel.PrimaryPart
+    if not handle then return false end
+    local targetPos = handle.Position + Vector3.new(0, 2.6, 0)
+    -- safe TP to chest (chunked)
+    local ok = SafeTP(CFrame.new(targetPos))
+    if not ok then return false end
+    -- wait small time for server to register touch/pick
+    task.wait(0.5)
+    -- mark as picked to avoid repeat
+    MarkPicked(chestModel)
+    return true
+end
+-- Part 5/5 (Main loop + auto-hop + final glue)
+NotifyViet("🚀 TuanxAura Chest Finder v4 khởi động...")
+local pickedCount = 0
+local noChestTime = 0
+
+-- store refs for UI access
+_G.TuanxAura_Chest_v4.Main = _G.TuanxAura_Chest_v4.Main or _G.TuanxAura_Chest_v4.Main
+_G.TuanxAura_Chest_v4.Status = _G.TuanxAura_Chest_v4.Status or _G.TuanxAura_Chest_v4.Status
+
+-- Main scanning loop
+task.spawn(function()
+    while true do
+        -- ensure character and hrp
+        if not player.Character or not getHRP() then
+            WaitForCharacter()
+        end
+
+        -- find chests
+        local targets = {}
+        pcall(function() targets = FindAllChests() end)
+        CleanupESPs()
+
+        if targets and #targets > 0 then
+            noChestTime = 0
+            -- sort by distance
+            table.sort(targets, function(a,b)
+                local aPos = (a:FindFirstChild("Handle") and a.Handle.Position) or (a.PrimaryPart and a.PrimaryPart.Position) or a:GetModelCFrame().p
+                local bPos = (b:FindFirstChild("Handle") and b.Handle.Position) or (b.PrimaryPart and b.PrimaryPart.Position) or b:GetModelCFrame().p
+                local hrp = getHRP()
+                if not hrp then return false end
+                return (aPos - hrp.Position).Magnitude < (bPos - hrp.Position).Magnitude
+            end)
+
+            -- iterate through nearest few
+            for i = 1, math.min(#targets, 6) do
+                local chest = targets[i]
+                if IsValidChest(chest) then
+                    local label = chest.Name or ("Chest"..i)
+                    local part = chest:FindFirstChild("Handle") or chest.PrimaryPart
+                    pcall(function() CreateESPForPart(part, label) end)
+                end
+            end
+
+            -- pick nearest
+            local nearest = targets[1]
+            if nearest and IsValidChest(nearest) then
+                pcall(function() _G.TuanxAura_Chest_v4.Status.Text = "🔎 Đang di chuyển tới: "..tostring(nearest.Name) end)
+                local picked = AttemptPickupChest(nearest)
+                if picked then
+                    pickedCount = pickedCount + 1
+                    pcall(function() _G.TuanxAura_Chest_v4.Counter.Text = "🪙 Đã nhặt: "..tostring(pickedCount) end)
+                    NotifyViet("🪙 Đã nhặt rương! Tổng: "..tostring(pickedCount))
+                    -- optionally return to safe land
+                    if SETTINGS.ReturnAfterPick then
+                        local hrp = getHRP()
+                        if hrp then
+                            local land = GetSafeLandBelow(hrp.Position)
+                            pcall(function() SafeTP(CFrame.new(land)) end)
+                        end
+                    end
+                end
+                task.wait(0.6)
+            end
+        else
+            noChestTime = noChestTime + math.clamp(SETTINGS.ScanInterval or 2, 0.5, 6)
+            pcall(function() _G.TuanxAura_Chest_v4.Status.Text = string.format("⏳ Không tìm thấy rương... (%.1fs)", noChestTime) end)
+            if noChestTime >= (SETTINGS.HopTimeout or 30) then
+                -- auto hop
+                NotifyViet("🔄 Không tìm thấy rương sau "..tostring(SETTINGS.HopTimeout).."s — chuyển server...")
+                pcall(function() TeleportService:Teleport(game.PlaceId, player) end)
+                noChestTime = 0
+                task.wait(6)
+            end
+        end
+
+        -- cleanup old ESPs and wait
+        CleanupESPs()
+        task.wait(math.clamp(SETTINGS.ScanInterval or 2, 0.5, 4))
+    end
+end)
+
+-- Respawn recovery
+player.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    -- when respawn, try to move to safe land
+    if getHRP() then
+        local land = GetSafeLandBelow(getHRP().Position)
+        pcall(function() SafeTP(CFrame.new(land)) end)
+    end
+end)
+
+NotifyViet("✅ TuanxAura v4 sẵn sàng — UI: " .. tostring(SETTINGS.UIVisible))
